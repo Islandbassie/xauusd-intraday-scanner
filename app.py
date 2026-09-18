@@ -1,210 +1,109 @@
-import streamlit as st
-import pandas as pd
+import asyncio
+from datetime import datetime, timezone
 import numpy as np
-import yfinance as yf
-import matplotlib.pyplot as plt
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+from metaapi_cloud_sdk import MetaApi
 
-st.set_page_config(page_title="XAUUSD Intraday Scanner", page_icon="🥇", layout="wide")
+st.set_page_config(page_title='XAUUSD Intraday Scanner', page_icon='🥇', layout='wide')
+DEFAULT_ACCOUNT='e72c2ef2-6907-4a3a-90cd-d3846964629d'
+DEFAULT_SYMBOL='XAUUSD'
 
-st.title("🥇 XAUUSD Intraday Setup Scanner")
-st.caption("Decision-support scanner — no automatic order execution.")
+async def get_mt5(token, account_id, symbol):
+    api=MetaApi(token=token)
+    try:
+        account=await api.metatrader_account_api.get_account(account_id=account_id)
+        conn=account.get_rpc_connection()
+        await conn.connect()
+        await conn.wait_synchronized()
+        price=await conn.get_symbol_price(symbol)
+        candles={}
+        for tf in ('1h','15m','5m'):
+            candles[tf]=await conn.get_historical_candles(symbol=symbol,timeframe=tf,start_time=None,limit=250)
+        return {'account':account,'price':price,'candles':candles}
+    finally:
+        try: await api.close()
+        except Exception: pass
 
-# ----------------------------
-# Settings
-# ----------------------------
-with st.sidebar:
-    st.header("Scanner settings")
-    symbol = st.text_input("Yahoo symbol", "GC=F")
-    period = st.selectbox("Data period", ["5d", "10d", "1mo"], index=1)
-    setup_tf = st.selectbox("Setup timeframe", ["5m", "15m", "30m"], index=1)
-    htf_tf = st.selectbox("Higher timeframe", ["30m", "1h", "4h"], index=1)
-    min_score = st.slider("Minimum setup-condition score", 0, 100, 45)
-    risk_pct = st.number_input("Example account risk %", 0.1, 5.0, 1.0, 0.1)
-    account = st.number_input("Example account size", 1000.0, 1000000.0, 10000.0, 500.0)
+def fetch(token, account_id, symbol):
+    return asyncio.run(get_mt5(token, account_id, symbol))
 
-@st.cache_data(ttl=60)
-def load_data(symbol, period, interval):
-    df = yf.download(symbol, period=period, interval=interval,
-                     auto_adjust=False, progress=False)
-    if df.empty:
-        return pd.DataFrame()
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-    return df[["Open","High","Low","Close"]].dropna()
+def df_from(candles):
+    df=pd.DataFrame([{'time':pd.to_datetime(x['time'],utc=True),'open':float(x['open']),'high':float(x['high']),'low':float(x['low']),'close':float(x['close']),'volume':float(x.get('tickVolume',x.get('volume',0)))} for x in candles])
+    return df.drop_duplicates('time').sort_values('time').reset_index(drop=True)
 
 def indicators(df):
-    x = df.copy()
-    x["EMA20"] = x.Close.ewm(span=20, adjust=False).mean()
-    x["EMA50"] = x.Close.ewm(span=50, adjust=False).mean()
-    x["EMA200"] = x.Close.ewm(span=200, adjust=False).mean()
-    d = x.Close.diff()
-    gain, loss = d.clip(lower=0), -d.clip(upper=0)
-    ag = gain.ewm(alpha=1/14, adjust=False).mean()
-    al = loss.ewm(alpha=1/14, adjust=False).mean()
-    x["RSI"] = (100 - 100/(1 + ag/al.replace(0,np.nan))).fillna(50)
-    e12 = x.Close.ewm(span=12, adjust=False).mean()
-    e26 = x.Close.ewm(span=26, adjust=False).mean()
-    x["MACD"] = e12-e26
-    x["MACDSignal"] = x.MACD.ewm(span=9, adjust=False).mean()
-    prev = x.Close.shift(1)
-    tr = pd.concat([(x.High-x.Low), (x.High-prev).abs(), (x.Low-prev).abs()], axis=1).max(axis=1)
-    x["ATR"] = tr.ewm(alpha=1/14, adjust=False).mean()
-    return x.dropna()
+    d=df.copy(); d['ema20']=d.close.ewm(span=20,adjust=False).mean(); d['ema50']=d.close.ewm(span=50,adjust=False).mean()
+    delta=d.close.diff(); gain=delta.clip(lower=0).rolling(14).mean(); loss=(-delta.clip(upper=0)).rolling(14).mean().replace(0,np.nan); d['rsi']=100-(100/(1+gain/loss))
+    tr=pd.concat([d.high-d.low,(d.high-d.close.shift()).abs(),(d.low-d.close.shift()).abs()],axis=1).max(axis=1); d['atr']=tr.rolling(14).mean()
+    return d
 
-def bias(df):
-    if len(df) < 10: return "UNKNOWN"
-    r=df.iloc[-1]
-    if r.Close > r.EMA20 > r.EMA50 > r.EMA200: return "STRONG BULLISH"
-    if r.Close < r.EMA20 < r.EMA50 < r.EMA200: return "STRONG BEARISH"
-    if r.Close > r.EMA50 and r.EMA20 > r.EMA50: return "BULLISH"
-    if r.Close < r.EMA50 and r.EMA20 < r.EMA50: return "BEARISH"
-    return "RANGING"
+def bias(d):
+    x=d.iloc[-1]
+    if x.close>x.ema20>x.ema50: return 'BULLISH'
+    if x.close<x.ema20<x.ema50: return 'BEARISH'
+    return 'NEUTRAL'
 
-def swings(df, n=3):
-    highs=[]; lows=[]
-    for i in range(n, len(df)-n):
-        if df.High.iloc[i] == df.High.iloc[i-n:i+n+1].max(): highs.append(i)
-        if df.Low.iloc[i] == df.Low.iloc[i-n:i+n+1].min(): lows.append(i)
-    return highs,lows
+def structure(d):
+    x=d.tail(30)
+    if len(x)<10:return 'NEUTRAL'
+    hi=x.high.rolling(5,center=True).max().dropna(); lo=x.low.rolling(5,center=True).min().dropna()
+    if len(hi)<2 or len(lo)<2:return 'NEUTRAL'
+    if hi.iloc[-1]>hi.iloc[-2] and lo.iloc[-1]>lo.iloc[-2]:return 'BULLISH'
+    if hi.iloc[-1]<hi.iloc[-2] and lo.iloc[-1]<lo.iloc[-2]:return 'BEARISH'
+    return 'NEUTRAL'
 
-def structure(df):
-    hi,lo=swings(df)
-    if len(hi)<2 or len(lo)<2: return "RANGING",None,None
-    if df.High.iloc[hi[-1]] > df.High.iloc[hi[-2]] and df.Low.iloc[lo[-1]] > df.Low.iloc[lo[-2]]:
-        state="BULLISH"
-    elif df.High.iloc[hi[-1]] < df.High.iloc[hi[-2]] and df.Low.iloc[lo[-1]] < df.Low.iloc[lo[-2]]:
-        state="BEARISH"
-    else: state="RANGING"
-    bos=None
-    if df.Close.iloc[-1] > df.High.iloc[hi[-2]]: bos="BULLISH BOS"
-    elif df.Close.iloc[-1] < df.Low.iloc[lo[-2]]: bos="BEARISH BOS"
-    return state,bos,(hi,lo)
-
-def liquidity(df):
-    hi,lo=swings(df)
-    if not hi or not lo: return None
-    atr=float(df.ATR.iloc[-1])
-    h=float(df.High.iloc[-1]); l=float(df.Low.iloc[-1]); c=float(df.Close.iloc[-1])
-    rh=float(df.High.iloc[hi[-1]]); rl=float(df.Low.iloc[lo[-1]])
-    tol=atr*.12
-    if h>rh and h>=rh-tol and c<rh: return ("BUY-SIDE SWEEP",rh)
-    if l<rl and l<=rl+tol and c>rl: return ("SELL-SIDE SWEEP",rl)
+def fvg(d):
+    for i in range(len(d)-1,1,-1):
+        a=d.iloc[i-2]; c=d.iloc[i]
+        if c.low>a.high:return ('BULLISH',float(a.high),float(c.low))
+        if c.high<a.low:return ('BEARISH',float(c.high),float(a.low))
     return None
 
-def fvgs(df):
-    out=[]
-    for i in range(2,len(df)):
-        a,b,c=df.iloc[i-2],df.iloc[i-1],df.iloc[i]
-        atr=float(b.ATR)
-        if float(c.Low)-float(a.High) > atr*.10:
-            out.append(("BULLISH FVG",float(a.High),float(c.Low),df.index[i-2]))
-        if float(a.Low)-float(c.High) > atr*.10:
-            out.append(("BEARISH FVG",float(c.High),float(a.Low),df.index[i-2]))
-    return out
+def setup(d5,d15,d1):
+    d5,d15,d1=map(indicators,(d5,d15,d1)); b1,b15,s15=bias(d1),bias(d15),structure(d15); r=float(d5.rsi.iloc[-1]) if pd.notna(d5.rsi.iloc[-1]) else 50; atr=float(d5.atr.iloc[-1]) if pd.notna(d5.atr.iloc[-1]) else float((d5.high-d5.low).tail(14).mean()); p=float(d5.close.iloc[-1]); sell=buy=0; sr=[]; br=[]
+    if b1=='BEARISH':sell+=25;sr.append('1H bearish EMA alignment')
+    elif b1=='BULLISH':buy+=25;br.append('1H bullish EMA alignment')
+    if b15=='BEARISH':sell+=20;sr.append('15M bearish EMA alignment')
+    elif b15=='BULLISH':buy+=20;br.append('15M bullish EMA alignment')
+    if s15=='BEARISH':sell+=20;sr.append('15M bearish structure')
+    elif s15=='BULLISH':buy+=20;br.append('15M bullish structure')
+    if r<45:sell+=10;sr.append('5M momentum below neutral')
+    if r>55:buy+=10;br.append('5M momentum above neutral')
+    z=fvg(d15)
+    if z and z[0]=='BEARISH':sell+=15;sr.append('Recent bearish FVG')
+    if z and z[0]=='BULLISH':buy+=15;br.append('Recent bullish FVG')
+    return {'price':p,'rsi':r,'atr':atr,'b1':b1,'b15':b15,'s15':s15,'sell':min(sell,100),'buy':min(buy,100),'sr':sr,'br':br,'fvg':z}
 
-def make_setup(df, direction, score, reasons, kind):
-    last=df.iloc[-1]; entry=float(last.Close); atr=float(last.ATR)
-    hi,lo=swings(df)
-    if direction=="BUY":
-        base=float(df.Low.iloc[lo[-1]]) if lo else entry-atr*1.2
-        sl=min(base-atr*.20, entry-atr*1.2)
-        risk=entry-sl
-        tp1=entry+1.5*risk; tp2=entry+2.5*risk
-    else:
-        base=float(df.High.iloc[hi[-1]]) if hi else entry+atr*1.2
-        sl=max(base+atr*.20, entry+atr*1.2)
-        risk=sl-entry
-        tp1=entry-1.5*risk; tp2=entry-2.5*risk
-    if risk<=0:return None
-    return dict(direction=direction, kind=kind, score=score, entry=entry, sl=sl, tp1=tp1, tp2=tp2,
-                rr1=1.5, rr2=2.5, reasons=reasons)
+def chart(d,title):
+    d=d.tail(120); fig=go.Figure([go.Candlestick(x=d.time,open=d.open,high=d.high,low=d.low,close=d.close,name='XAUUSD'),go.Scatter(x=d.time,y=d.ema20,name='EMA20'),go.Scatter(x=d.time,y=d.ema50,name='EMA50')]); fig.update_layout(title=title,height=500,xaxis_rangeslider_visible=False); return fig
 
-def scan(htf, mtf):
-    hb=bias(htf); mb=bias(mtf); st,bos,_=structure(mtf); sw=liquidity(mtf); gaps=fvgs(mtf)
-    mom="BULLISH" if mtf.RSI.iloc[-1]>55 and mtf.MACD.iloc[-1]>mtf.MACDSignal.iloc[-1] else \
-        "BEARISH" if mtf.RSI.iloc[-1]<45 and mtf.MACD.iloc[-1]<mtf.MACDSignal.iloc[-1] else "NEUTRAL"
-    results=[]
-    for direction in ["BUY","SELL"]:
-        score=0; reasons=[]
-        bull=direction=="BUY"
-        if (bull and "BULLISH" in hb) or ((not bull) and "BEARISH" in hb): score+=20; reasons.append("HTF EMA alignment")
-        if (bull and "BULLISH" in mb) or ((not bull) and "BEARISH" in mb): score+=20; reasons.append("15m/setup EMA alignment")
-        if mom==direction.replace("BUY","BULLISH").replace("SELL","BEARISH"): score+=15; reasons.append("Momentum confirmation")
-        if bos==( "BULLISH BOS" if bull else "BEARISH BOS"): score+=20; reasons.append("Break of structure")
-        if sw and sw[0]==("SELL-SIDE SWEEP" if bull else "BUY-SIDE SWEEP"): score+=15; reasons.append("Liquidity sweep")
-        ftype="BULLISH FVG" if bull else "BEARISH FVG"
-        if any(g[0]==ftype for g in gaps[-5:]): score+=10; reasons.append("Recent FVG")
-        if score>=min_score:
-            s=make_setup(mtf,direction,score,reasons,"STRUCTURE / LIQUIDITY")
-            if s: results.append(s)
-    return results,dict(htf=hb,mtf=mb,momentum=mom,structure=st,bos=bos or "NONE",
-                        liquidity=sw[0] if sw else "NONE",fvg_count=len(gaps))
-
-# ----------------------------
-# Load
-# ----------------------------
+st.title('🥇 XAUUSD Intraday Setup Scanner')
+st.caption('BlackBull Markets MT5 market data via MetaApi • read-only decision support • no automatic order execution')
+with st.sidebar:
+    st.header('Scanner settings'); symbol=st.text_input('MT5 symbol',DEFAULT_SYMBOL).strip().upper(); threshold=st.slider('Minimum setup score',0,100,45,5); refresh=st.button('🔄 Refresh MT5 data',use_container_width=True)
+    st.divider(); st.write('Data source: **BlackBull Markets — MT5**'); st.write('Server: `BlackbullMarkets-Live`')
 try:
-    htf = indicators(load_data(symbol, period, htf_tf))
-    mtf = indicators(load_data(symbol, period, setup_tf))
-except Exception as e:
-    st.error(str(e)); st.stop()
-
-if htf.empty or mtf.empty:
-    st.warning("No data available. Check symbol, internet access, or market/data availability.")
-    st.stop()
-
-setups,diag=scan(htf,mtf)
-last=mtf.iloc[-1]
-
-# Header metrics
-c1,c2,c3,c4,c5=st.columns(5)
-c1.metric("XAUUSD proxy",f"{float(last.Close):.2f}")
-c2.metric("HTF",diag["htf"])
-c3.metric("Setup TF",diag["mtf"])
-c4.metric("Structure",diag["structure"])
-c5.metric("RSI",f"{float(last.RSI):.1f}")
-
-st.divider()
-
-# Setup cards
-if not setups:
-    st.info("NO TRADE — no setup currently meets the selected condition score.")
-else:
-    setups=sorted(setups,key=lambda x:x["score"],reverse=True)
-    for s in setups:
-        st.subheader(f"{'🟢' if s['direction']=='BUY' else '🔴'} {s['direction']} — {s['kind']}  |  {s['score']}/100")
-        a,b,c,d,e=st.columns(5)
-        a.metric("Entry",f"{s['entry']:.2f}")
-        b.metric("SL",f"{s['sl']:.2f}")
-        c.metric("TP1",f"{s['tp1']:.2f}")
-        d.metric("TP2",f"{s['tp2']:.2f}")
-        e.metric("R:R",f"1:{s['rr2']:.1f}")
-        risk_money=account*risk_pct/100
-        qty=risk_money/abs(s["entry"]-s["sl"])
-        st.write("**Conditions:** "+" • ".join(s["reasons"]))
-        st.caption(f"Example risk ${risk_money:.2f}; distance-based quantity ≈ {qty:.2f} units. Broker lot sizing varies.")
-        st.divider()
-
-# Chart
-st.subheader("Live-style chart markup")
-plot=mtf.tail(150)
-fig,ax=plt.subplots(figsize=(16,7))
-ax.plot(plot.index,plot.Close,label="Price")
-ax.plot(plot.index,plot.EMA20,label="EMA20")
-ax.plot(plot.index,plot.EMA50,label="EMA50")
-ax.plot(plot.index,plot.EMA200,label="EMA200")
-for s in setups:
-    ax.axhline(s["entry"],linestyle="-",linewidth=1.2,label=f"{s['direction']} Entry")
-    ax.axhline(s["sl"],linestyle=":",linewidth=1.2,label="SL")
-    ax.axhline(s["tp1"],linestyle="--",linewidth=1.0,label="TP1")
-    ax.axhline(s["tp2"],linestyle="--",linewidth=1.0,label="TP2")
-ax.set_title("XAUUSD setup markup")
-ax.grid(True,alpha=.2); ax.legend(ncol=3)
-st.pyplot(fig)
-
-# Diagnostics
-with st.expander("Scanner diagnostics"):
-    st.json(diag)
-    st.write("Latest candle:", {k: float(last[k]) for k in ["Open","High","Low","Close","ATR","RSI"]})
-
-st.caption("Data source: Yahoo Finance Gold Futures proxy (GC=F). For broker-accurate XAUUSD, connect the backend to your MT5 terminal.")
+    token=st.secrets['METAAPI_TOKEN']; account_id=st.secrets.get('METAAPI_ACCOUNT_ID',DEFAULT_ACCOUNT)
+except Exception:
+    st.error('MetaApi secrets are missing. Add METAAPI_TOKEN and METAAPI_ACCOUNT_ID in Streamlit Cloud → Manage app → Settings → Secrets.'); st.stop()
+if refresh or 'mt5' not in st.session_state:
+    with st.spinner('Connecting to BlackBull MT5 and loading 5M / 15M / 1H candles...'):
+        try: st.session_state.mt5=fetch(token,account_id,symbol); st.session_state.err=None; st.session_state.refreshed=datetime.now(timezone.utc)
+        except Exception as e: st.session_state.err=str(e)
+if st.session_state.get('err'):
+    st.error('MT5/MetaApi data error'); st.code(st.session_state.err); st.info('Check that MetaApi shows the account as CONNECTED and DEPLOYED, and that the broker symbol is exactly XAUUSD.'); st.stop()
+raw=st.session_state.mt5; price=raw['price']; d5=indicators(df_from(raw['candles']['5m'])); d15=indicators(df_from(raw['candles']['15m'])); d1=indicators(df_from(raw['candles']['1h'])); s=setup(d5,d15,d1); bid=float(price['bid']); ask=float(price['ask'])
+a,b,c,d,e=st.columns(5); a.metric('XAUUSD Bid',f'{bid:,.2f}'); b.metric('XAUUSD Ask',f'{ask:,.2f}'); c.metric('1H Bias',s['b1']); d.metric('15M Structure',s['s15']); e.metric('5M RSI',f'{s["rsi"]:.1f}')
+st.success(f"🟢 BlackBull MT5 connected • Server: {getattr(raw['account'],'server','BlackbullMarkets-Live')} • Broker quote: {price.get('brokerTime',price.get('time',''))}")
+st.divider(); l,r=st.columns(2)
+with l:
+    st.subheader(f'🔴 SELL setup — {s["sell"]}/100'); st.write('Conditions: '+(' • '.join(s['sr']) if s['sr'] else 'No strong bearish conditions')); st.info('Analytical setup only — verify live market conditions before acting.') if s['sell']<threshold else st.warning('Score is above your selected threshold.')
+with r:
+    st.subheader(f'🟢 BUY setup — {s["buy"]}/100'); st.write('Conditions: '+(' • '.join(s['br']) if s['br'] else 'No strong bullish conditions')); st.info('Analytical setup only — verify live market conditions before acting.') if s['buy']<threshold else st.success('Score is above your selected threshold.')
+st.divider(); st.subheader('📊 BlackBull XAUUSD charts'); t1,t2,t3=st.tabs(['5M','15M','1H'])
+with t1: st.plotly_chart(chart(d5,'BlackBull XAUUSD — 5M'),use_container_width=True)
+with t2: st.plotly_chart(chart(d15,'BlackBull XAUUSD — 15M'),use_container_width=True)
+with t3: st.plotly_chart(chart(d1,'BlackBull XAUUSD — 1H'),use_container_width=True)
+st.caption('Scores are rule-based technical conditions, not guarantees or automatic trade instructions. The app does not place trades.')
