@@ -19,16 +19,14 @@ DEFAULT_SYMBOL = "XAUUSD"
 
 async def get_mt5(token, account_id, symbol):
     """
-    Use:
-      - RPC connection for historical candles
-      - Streaming connection for live market data
+    Use MetaApi's account historical-data API for candles and the
+    streaming connection for the live XAUUSD quote.
 
-    MetaApi's Python SDK exposes subscribe_to_market_data() on the
-    streaming connection, not on RpcMetaApiConnectionInstance.
+    Historical candles are exposed by MetatraderAccount.get_historical_candles();
+    subscribe_to_market_data() belongs to the streaming connection.
     """
     api = MetaApi(token=token)
 
-    rpc = None
     streaming = None
 
     try:
@@ -36,43 +34,25 @@ async def get_mt5(token, account_id, symbol):
             account_id=account_id
         )
 
-        # -----------------------------
-        # 1) RPC connection: candles
-        # -----------------------------
-        rpc = account.get_rpc_connection()
-        await rpc.connect()
-        await rpc.wait_synchronized()
-
-        # Check that the broker exposes the requested symbol.
-        try:
-            symbols = await rpc.get_symbols()
-            if symbols and symbol not in symbols:
-                matches = [
-                    s for s in symbols
-                    if "XAU" in s.upper() or "GOLD" in s.upper()
-                ]
-                detail = ", ".join(matches[:20]) if matches else "No XAU/GOLD symbols found."
-                raise RuntimeError(
-                    f"Symbol '{symbol}' is not available on this MT5 account. "
-                    f"Gold-related symbols returned by MetaApi: {detail}"
-                )
-        except AttributeError:
-            # Older SDK versions may not expose get_symbols() on RPC.
-            # Continue and let the actual candle/quote request validate it.
-            pass
-
+        # ---------------------------------------------------------
+        # 1) Historical candles
+        # ---------------------------------------------------------
+        # IMPORTANT: MetaApi exposes historical market data on the
+        # MetatraderAccount object itself, not on RpcMetaApiConnection.
+        # The current Python SDK documents account.get_historical_candles().
         candles = {}
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         for tf in ("1h", "15m", "5m"):
-            candles[tf] = await rpc.get_historical_candles(
+            candles[tf] = await account.get_historical_candles(
                 symbol=symbol,
                 timeframe=tf,
-                start_time=None,
+                start_time=now,
                 limit=250,
             )
 
-        # -----------------------------
+        # ---------------------------------------------------------
         # 2) Streaming connection: live quote
-        # -----------------------------
+        # ---------------------------------------------------------
         streaming = account.get_streaming_connection()
         await streaming.connect()
         await streaming.wait_synchronized()
@@ -105,12 +85,6 @@ async def get_mt5(token, account_id, symbol):
         try:
             if streaming is not None:
                 await streaming.close()
-        except Exception:
-            pass
-
-        try:
-            if rpc is not None:
-                await rpc.close()
         except Exception:
             pass
 
