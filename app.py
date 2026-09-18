@@ -331,6 +331,47 @@ with st.sidebar:
         5,
     )
 
+    st.subheader("Risk & cost settings")
+
+    account_size = st.number_input(
+        "Account size ($)",
+        min_value=100.0,
+        value=10000.0,
+        step=100.0,
+    )
+
+    risk_pct = st.number_input(
+        "Risk per trade (%)",
+        min_value=0.01,
+        max_value=10.0,
+        value=1.0,
+        step=0.1,
+    )
+
+    lot_size = st.number_input(
+        "Lot size",
+        min_value=0.01,
+        max_value=100.0,
+        value=0.10,
+        step=0.01,
+        format="%.2f",
+    )
+
+    contract_size = st.number_input(
+        "XAUUSD contract size (oz/lot)",
+        min_value=1.0,
+        value=100.0,
+        step=1.0,
+    )
+
+    # BlackBull ECN Standard: commission defaults to $0.
+    commission_per_lot_round_turn = st.number_input(
+        "Commission ($/lot, round turn)",
+        min_value=0.0,
+        value=0.0,
+        step=0.1,
+    )
+
     refresh = st.button(
         "🔄 Refresh MT5 data",
         use_container_width=True,
@@ -409,6 +450,17 @@ ask = float(price["ask"])
 
 spread = ask - bid
 
+# Trading-cost / risk calculations.
+spread_cost = spread * contract_size * lot_size
+commission_cost = commission_per_lot_round_turn * lot_size
+round_turn_cost = spread_cost + commission_cost
+
+risk_amount = account_size * (risk_pct / 100.0)
+risk_distance = (
+    risk_amount / (contract_size * lot_size)
+    if contract_size > 0 and lot_size > 0
+    else 0.0
+)
 
 a, b, c, d, e = st.columns(5)
 
@@ -450,6 +502,28 @@ st.success(
     f"Live XAUUSD quote received"
 )
 
+st.divider()
+
+st.subheader("💰 BlackBull ECN Standard — estimated trading cost")
+
+cost1, cost2, cost3, cost4 = st.columns(4)
+
+cost1.metric("Live spread", f"${spread:.2f}/oz")
+cost2.metric(f"Spread cost ({lot_size:.2f} lot)", f"${spread_cost:.2f}")
+cost3.metric("Commission", f"${commission_cost:.2f}")
+cost4.metric("Estimated round-turn cost", f"${round_turn_cost:.2f}")
+
+st.caption(
+    "ECN Standard commission is set to $0 by default. "
+    "The spread is taken directly from the live MT5 Bid/Ask quote. "
+    "Swap/overnight financing is not included."
+)
+
+risk1, risk2, risk3 = st.columns(3)
+
+risk1.metric("Account risk", f"${risk_amount:,.2f}", f"{risk_pct:.2f}%")
+risk2.metric("Selected volume", f"{lot_size:.2f} lot")
+risk3.metric("Risk distance", f"${risk_distance:.2f}/oz")
 
 st.divider()
 
