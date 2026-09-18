@@ -17,6 +17,21 @@ async def get_mt5(token, account_id, symbol):
         conn=account.get_rpc_connection()
         await conn.connect()
         await conn.wait_synchronized()
+
+        # MetaApi requires a market-data subscription before a live quote
+        # is available through the RPC connection.
+        await conn.subscribe_to_market_data(symbol)
+
+        # Confirm that the broker actually exposes this exact symbol.
+        symbols = await conn.get_symbols()
+        if symbol not in symbols:
+            matches = [s for s in symbols if 'XAU' in s.upper() or 'GOLD' in s.upper()]
+            detail = ', '.join(matches[:20]) if matches else 'No XAU/GOLD symbols were returned by the broker.'
+            raise RuntimeError(
+                f"Symbol '{symbol}' is not available on the connected MT5 account. "
+                f"Gold-related symbols found: {detail}"
+            )
+
         price=await conn.get_symbol_price(symbol)
         candles={}
         for tf in ('1h','15m','5m'):
