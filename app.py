@@ -331,6 +331,21 @@ with st.sidebar:
         5,
     )
 
+    st.subheader("Live scanner")
+
+    auto_refresh = st.checkbox(
+        "Auto-update scanner",
+        value=True,
+        help="Refresh the MT5 data automatically while this page is open.",
+    )
+
+    refresh_seconds = st.selectbox(
+        "Update interval",
+        [3, 5, 10, 15, 30],
+        index=1,
+        disabled=not auto_refresh,
+    )
+
     st.subheader("Risk & cost settings")
 
     account_size = st.number_input(
@@ -397,218 +412,195 @@ except Exception:
     st.stop()
 
 
-if refresh or "mt5" not in st.session_state:
-    with st.spinner(
-        "Connecting to BlackBull MT5 and loading 5M / 15M / 1H candles..."
-    ):
-        try:
-            st.session_state.mt5 = fetch(
-                token,
-                account_id,
-                symbol,
+
+def render_live_scanner():
+    """Fetch fresh MT5 data and redraw the live scanner."""
+    try:
+        live = fetch(token, account_id, symbol)
+        st.session_state.mt5 = live
+        st.session_state.err = None
+        st.session_state.last_update = datetime.now(timezone.utc)
+    except Exception as e:
+        st.session_state.err = str(e)
+
+    if st.session_state.get("err"):
+        st.error("MT5/MetaApi data error")
+        st.code(st.session_state.err)
+        st.info(
+            "The live scanner could not refresh this cycle. "
+            "Confirm the MetaApi connection and that XAUUSD is visible "
+            "in BlackBull MT5 Market Watch."
+        )
+        return
+
+    raw = st.session_state.mt5
+    price = raw["price"]
+
+    d5 = indicators(df_from(raw["candles"]["5m"]))
+    d15 = indicators(df_from(raw["candles"]["15m"]))
+    d1 = indicators(df_from(raw["candles"]["1h"]))
+
+    s = setup(d5, d15, d1)
+
+    bid = float(price["bid"])
+    ask = float(price["ask"])
+    spread = ask - bid
+
+    spread_cost = spread * contract_size * lot_size
+    commission_cost = commission_per_lot_round_turn * lot_size
+    round_turn_cost = spread_cost + commission_cost
+
+    risk_amount = account_size * (risk_pct / 100.0)
+    risk_distance = (
+        risk_amount / (contract_size * lot_size)
+        if contract_size > 0 and lot_size > 0
+        else 0.0
+    )
+
+    a, b, c, d, e = st.columns(5)
+    a.metric("XAUUSD Bid", f"{bid:,.2f}")
+    b.metric("XAUUSD Ask", f"{ask:,.2f}")
+    c.metric("Spread", f"{spread:.2f}")
+    d.metric("1H Bias", s["b1"])
+    e.metric("5M RSI", f"{s['rsi']:.1f}")
+
+    server_name = getattr(
+        raw["account"],
+        "server",
+        "BlackbullMarkets-Live",
+    )
+
+    update_time = st.session_state.get("last_update")
+    update_text = (
+        update_time.strftime("%H:%M:%S UTC")
+        if update_time
+        else "unknown"
+    )
+
+    st.success(
+        f"🟢 BlackBull MT5 connected • "
+        f"Server: {server_name} • "
+        f"Live XAUUSD quote received • "
+        f"Last update: {update_text}"
+    )
+
+    st.divider()
+
+    st.subheader("💰 BlackBull ECN Standard — estimated trading cost")
+
+    cost1, cost2, cost3, cost4 = st.columns(4)
+    cost1.metric("Live spread", f"${spread:.2f}/oz")
+    cost2.metric(
+        f"Spread cost ({lot_size:.2f} lot)",
+        f"${spread_cost:.2f}",
+    )
+    cost3.metric("Commission", f"${commission_cost:.2f}")
+    cost4.metric(
+        "Estimated round-turn cost",
+        f"${round_turn_cost:.2f}",
+    )
+
+    st.caption(
+        "ECN Standard commission is set to $0 by default. "
+        "The spread is taken directly from the live MT5 Bid/Ask quote. "
+        "Swap/overnight financing is not included."
+    )
+
+    risk1, risk2, risk3 = st.columns(3)
+    risk1.metric(
+        "Account risk",
+        f"${risk_amount:,.2f}",
+        f"{risk_pct:.2f}%",
+    )
+    risk2.metric("Selected volume", f"{lot_size:.2f} lot")
+    risk3.metric("Risk distance", f"${risk_distance:.2f}/oz")
+
+    st.divider()
+
+    left, right = st.columns(2)
+
+    with left:
+        st.subheader(f"🔴 SELL setup — {s['sell']}/100")
+        st.write(
+            "Conditions: "
+            + (
+                " • ".join(s["sr"])
+                if s["sr"]
+                else "No strong bearish conditions"
             )
-            st.session_state.err = None
-            st.session_state.refreshed = datetime.now(timezone.utc)
-
-        except Exception as e:
-            st.session_state.err = str(e)
-
-
-if st.session_state.get("err"):
-    st.error("MT5/MetaApi data error")
-    st.code(st.session_state.err)
-
-    st.info(
-        "The app now uses MetaApi's streaming connection for the live "
-        "XAUUSD quote and the RPC connection for historical candles. "
-        "Confirm that XAUUSD is visible in BlackBull MT5 Market Watch."
-    )
-
-    st.stop()
-
-
-raw = st.session_state.mt5
-
-price = raw["price"]
-
-d5 = indicators(
-    df_from(raw["candles"]["5m"])
-)
-
-d15 = indicators(
-    df_from(raw["candles"]["15m"])
-)
-
-d1 = indicators(
-    df_from(raw["candles"]["1h"])
-)
-
-s = setup(d5, d15, d1)
-
-bid = float(price["bid"])
-ask = float(price["ask"])
-
-spread = ask - bid
-
-# Trading-cost / risk calculations.
-spread_cost = spread * contract_size * lot_size
-commission_cost = commission_per_lot_round_turn * lot_size
-round_turn_cost = spread_cost + commission_cost
-
-risk_amount = account_size * (risk_pct / 100.0)
-risk_distance = (
-    risk_amount / (contract_size * lot_size)
-    if contract_size > 0 and lot_size > 0
-    else 0.0
-)
-
-a, b, c, d, e = st.columns(5)
-
-a.metric(
-    "XAUUSD Bid",
-    f"{bid:,.2f}",
-)
-
-b.metric(
-    "XAUUSD Ask",
-    f"{ask:,.2f}",
-)
-
-c.metric(
-    "Spread",
-    f"{spread:.2f}",
-)
-
-d.metric(
-    "1H Bias",
-    s["b1"],
-)
-
-e.metric(
-    "5M RSI",
-    f"{s['rsi']:.1f}",
-)
-
-
-server_name = getattr(
-    raw["account"],
-    "server",
-    "BlackbullMarkets-Live",
-)
-
-st.success(
-    f"🟢 BlackBull MT5 connected • "
-    f"Server: {server_name} • "
-    f"Live XAUUSD quote received"
-)
-
-st.divider()
-
-st.subheader("💰 BlackBull ECN Standard — estimated trading cost")
-
-cost1, cost2, cost3, cost4 = st.columns(4)
-
-cost1.metric("Live spread", f"${spread:.2f}/oz")
-cost2.metric(f"Spread cost ({lot_size:.2f} lot)", f"${spread_cost:.2f}")
-cost3.metric("Commission", f"${commission_cost:.2f}")
-cost4.metric("Estimated round-turn cost", f"${round_turn_cost:.2f}")
-
-st.caption(
-    "ECN Standard commission is set to $0 by default. "
-    "The spread is taken directly from the live MT5 Bid/Ask quote. "
-    "Swap/overnight financing is not included."
-)
-
-risk1, risk2, risk3 = st.columns(3)
-
-risk1.metric("Account risk", f"${risk_amount:,.2f}", f"{risk_pct:.2f}%")
-risk2.metric("Selected volume", f"{lot_size:.2f} lot")
-risk3.metric("Risk distance", f"${risk_distance:.2f}/oz")
-
-st.divider()
-
-left, right = st.columns(2)
-
-with left:
-    st.subheader(
-        f"🔴 SELL setup — {s['sell']}/100"
-    )
-
-    st.write(
-        "Conditions: "
-        + (
-            " • ".join(s["sr"])
-            if s["sr"]
-            else "No strong bearish conditions"
-        )
-    )
-
-    if s["sell"] < threshold:
-        st.info(
-            "Score is below your selected threshold. "
-            "Analytical setup only — verify live market conditions."
-        )
-    else:
-        st.warning(
-            "Score is above your selected threshold. "
-            "Analytical setup only — verify live market conditions."
         )
 
+        if s["sell"] < threshold:
+            st.info(
+                "Score is below your selected threshold. "
+                "Analytical setup only — verify live market conditions."
+            )
+        else:
+            st.warning(
+                "Score is above your selected threshold. "
+                "Analytical setup only — verify live market conditions."
+            )
 
-with right:
-    st.subheader(
-        f"🟢 BUY setup — {s['buy']}/100"
-    )
-
-    st.write(
-        "Conditions: "
-        + (
-            " • ".join(s["br"])
-            if s["br"]
-            else "No strong bullish conditions"
-        )
-    )
-
-    if s["buy"] < threshold:
-        st.info(
-            "Score is below your selected threshold. "
-            "Analytical setup only — verify live market conditions."
-        )
-    else:
-        st.success(
-            "Score is above your selected threshold. "
-            "Analytical setup only — verify live market conditions."
+    with right:
+        st.subheader(f"🟢 BUY setup — {s['buy']}/100")
+        st.write(
+            "Conditions: "
+            + (
+                " • ".join(s["br"])
+                if s["br"]
+                else "No strong bullish conditions"
+            )
         )
 
+        if s["buy"] < threshold:
+            st.info(
+                "Score is below your selected threshold. "
+                "Analytical setup only — verify live market conditions."
+            )
+        else:
+            st.success(
+                "Score is above your selected threshold. "
+                "Analytical setup only — verify live market conditions."
+            )
 
-st.divider()
+    st.divider()
 
-st.subheader("📊 BlackBull XAUUSD charts")
+    st.subheader("📊 BlackBull XAUUSD charts")
 
-t1, t2, t3 = st.tabs(
-    ["5M", "15M", "1H"]
-)
+    t1, t2, t3 = st.tabs(["5M", "15M", "1H"])
 
-with t1:
-    st.plotly_chart(
-        chart(d5, "BlackBull XAUUSD — 5M"),
-        use_container_width=True,
+    with t1:
+        st.plotly_chart(
+            chart(d5, "BlackBull XAUUSD — 5M"),
+            use_container_width=True,
+        )
+
+    with t2:
+        st.plotly_chart(
+            chart(d15, "BlackBull XAUUSD — 15M"),
+            use_container_width=True,
+        )
+
+    with t3:
+        st.plotly_chart(
+            chart(d1, "BlackBull XAUUSD — 1H"),
+            use_container_width=True,
+        )
+
+    st.caption(
+        "Scores are rule-based technical conditions, not guarantees or "
+        "automatic trade instructions. The app does not place trades. "
+        "Trading-cost figures are estimates based on the live spread and "
+        "selected lot size; verify the broker's final execution cost."
     )
 
-with t2:
-    st.plotly_chart(
-        chart(d15, "BlackBull XAUUSD — 15M"),
-        use_container_width=True,
-    )
 
-with t3:
-    st.plotly_chart(
-        chart(d1, "BlackBull XAUUSD — 1H"),
-        use_container_width=True,
-    )
+# Streamlit fragments support automatic reruns without rerunning the whole app.
+# This is suitable for a live scanner/monitoring display.
+run_every = f"{refresh_seconds}s" if auto_refresh else None
 
+@st.fragment(run_every=run_every)
+def live_scanner_fragment():
+    render_live_scanner()
 
-st.caption(
-    "Scores are rule-based technical conditions, not guarantees or "
-    "automatic trade instructions. The app does not place trades."
-)
+live_scanner_fragment()
