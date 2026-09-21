@@ -274,6 +274,84 @@ def setup(d5, d15, d1):
     }
 
 
+def trade_plan(d5, d15, signal, bid, ask):
+    """
+    Rule-based planning levels.
+
+    These are analytical levels, not guarantees or broker execution
+    instructions. The plan uses:
+      - current executable side of the quote for the entry reference
+      - recent 5M swing structure
+      - ATR as a volatility buffer
+      - fixed 1R / 2R / 3R targets
+    """
+    current = ask if signal == "BUY" else bid
+
+    atr = float(d5["atr"].iloc[-1])
+    if not np.isfinite(atr) or atr <= 0:
+        atr = float((d5["high"] - d5["low"]).tail(14).mean())
+
+    recent = d5.tail(20)
+
+    if signal == "BUY":
+        swing_low = float(recent["low"].min())
+        # Put SL below recent structure with an ATR buffer.
+        sl = swing_low - (0.15 * atr)
+
+        # If structure is too close, use an ATR-based fallback.
+        if sl >= current:
+            sl = current - atr
+
+        risk = current - sl
+        tp1 = current + risk
+        tp2 = current + (2 * risk)
+        tp3 = current + (3 * risk)
+
+    else:
+        swing_high = float(recent["high"].max())
+        sl = swing_high + (0.15 * atr)
+
+        if sl <= current:
+            sl = current + atr
+
+        risk = sl - current
+        tp1 = current - risk
+        tp2 = current - (2 * risk)
+        tp3 = current - (3 * risk)
+
+    rr1 = 1.0
+    rr2 = 2.0
+    rr3 = 3.0
+
+    return {
+        "signal": signal,
+        "entry": current,
+        "sl": sl,
+        "risk": risk,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "rr1": rr1,
+        "rr2": rr2,
+        "rr3": rr3,
+        "atr": atr,
+    }
+
+
+def classify_score(score):
+    if score >= 90:
+        return "VERY HIGH CONFLUENCE", "🔥"
+    if score >= 80:
+        return "HIGH CONFLUENCE", "🟢"
+    if score >= 70:
+        return "TRADE CANDIDATE", "🟢"
+    if score >= 60:
+        return "MODERATE", "🟡"
+    if score >= 45:
+        return "DEVELOPING", "⚪"
+    return "WAIT", "⚫"
+
+
 def chart(d, title):
     d = d.tail(120)
 
@@ -341,7 +419,7 @@ with st.sidebar:
 
     refresh_seconds = st.selectbox(
         "Update interval",
-        [60],
+        [300],
         index=0,
         disabled=not auto_refresh,
     )
@@ -446,6 +524,29 @@ def render_live_scanner():
     ask = float(price["ask"])
     spread = ask - bid
 
+    # Determine the stronger directional setup.
+    if s["buy"] > s["sell"]:
+        primary_signal = "BUY"
+        primary_score = s["buy"]
+    elif s["sell"] > s["buy"]:
+        primary_signal = "SELL"
+        primary_score = s["sell"]
+    else:
+        primary_signal = "NEUTRAL"
+        primary_score = s["buy"]
+
+    score_label, score_icon = classify_score(primary_score)
+
+    plan = None
+    if primary_signal in ("BUY", "SELL"):
+        plan = trade_plan(
+            d5,
+            d15,
+            primary_signal,
+            bid,
+            ask,
+        )
+
     spread_cost = spread * contract_size * lot_size
     commission_cost = commission_per_lot_round_turn * lot_size
     round_turn_cost = spread_cost + commission_cost
@@ -483,6 +584,93 @@ def render_live_scanner():
         f"Live XAUUSD quote received • "
         f"Last update: {update_text}"
     )
+
+    st.divider()
+
+    st.subheader("🎯 Intraday setup plan")
+
+    if primary_signal == "NEUTRAL":
+        st.info(
+            "⚪ BUY and SELL scores are equal. No directional setup "
+            "is currently preferred."
+        )
+    else:
+        st.markdown(
+            f"### {score_icon} {primary_signal} — "
+            f"{primary_score}/100"
+        )
+        st.write(f"**Classification:** {score_label}")
+
+        if primary_score < 70:
+            st.info(
+                "The setup is below the 70/100 Trade Candidate threshold. "
+                "Treat the levels below as analytical reference levels and "
+                "wait for additional price-action confirmation."
+            )
+        elif primary_score < 80:
+            st.warning(
+                "Trade Candidate: the rule-based conditions are aligned, "
+                "but confirmation is still required before considering an entry."
+            )
+        else:
+            st.success(
+                "High-confluence rule-based setup. The score measures "
+                "alignment of the scanner's conditions; it is not a "
+                "probability of winning."
+            )
+
+        if plan:
+            p1, p2, p3, p4 = st.columns(4)
+
+            p1.metric(
+                "Possible entry",
+                f"{plan['entry']:,.2f}",
+            )
+
+            p2.metric(
+                "Stop loss",
+                f"{plan['sl']:,.2f}",
+            )
+
+            p3.metric(
+                "TP1 / 1R",
+                f"{plan['tp1']:,.2f}",
+            )
+
+            p4.metric(
+                "TP2 / 2R",
+                f"{plan['tp2']:,.2f}",
+            )
+
+            p5, p6, p7, p8 = st.columns(4)
+
+            p5.metric(
+                "TP3 / 3R",
+                f"{plan['tp3']:,.2f}",
+            )
+
+            p6.metric(
+                "Risk distance",
+                f"{plan['risk']:,.2f}",
+            )
+
+            p7.metric(
+                "R:R to TP2",
+                "1:2",
+            )
+
+            p8.metric(
+                "R:R to TP3",
+                "1:3",
+            )
+
+            st.caption(
+                "Entry uses the current executable side of the live quote "
+                "(Ask for BUY / Bid for SELL). Stop loss uses recent 5M "
+                "structure plus an ATR buffer. TP levels are fixed 1R/2R/3R "
+                "planning targets. These are analytical levels, not guaranteed "
+                "future prices or automatic orders."
+            )
 
     st.divider()
 
@@ -597,7 +785,7 @@ def render_live_scanner():
 
 # Streamlit fragments support automatic reruns without rerunning the whole app.
 # This is suitable for a live scanner/monitoring display.
-# The scanner defaults to a 60-second refresh interval to reduce demand.
+# The scanner defaults to a 5-minute refresh interval to reduce demand.
 run_every = f"{refresh_seconds}s" if auto_refresh else None
 
 @st.fragment(run_every=run_every)
