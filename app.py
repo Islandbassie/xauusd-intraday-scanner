@@ -341,8 +341,8 @@ with st.sidebar:
 
     refresh_seconds = st.selectbox(
         "Update interval",
-        [3, 5, 10, 15, 30],
-        index=1,
+        [30],
+        index=0,
         disabled=not auto_refresh,
     )
 
@@ -597,6 +597,7 @@ def render_live_scanner():
 
 # Streamlit fragments support automatic reruns without rerunning the whole app.
 # This is suitable for a live scanner/monitoring display.
+# The scanner defaults to a 30-second refresh interval to reduce demand.
 run_every = f"{refresh_seconds}s" if auto_refresh else None
 
 @st.fragment(run_every=run_every)
