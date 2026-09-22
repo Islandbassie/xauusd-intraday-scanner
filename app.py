@@ -42,7 +42,7 @@ async def get_mt5(token, account_id, symbol):
         # The current Python SDK documents account.get_historical_candles().
         candles = {}
         now = datetime.now(timezone.utc).replace(tzinfo=None)
-        for tf in ("1h", "15m", "5m"):
+        for tf in ("1d", "4h", "1h", "15m"):
             candles[tf] = await account.get_historical_candles(
                 symbol=symbol,
                 timeframe=tf,
@@ -194,78 +194,96 @@ def fvg(d):
     return None
 
 
-def setup(d5, d15, d1):
-    d5, d15, d1 = map(indicators, (d5, d15, d1))
+def setup(d15, d1h, d4h, dd):
+    """
+    Multi-timeframe XAUUSD setup model.
 
-    b1 = bias(d1)
+    Directional bias is established from Daily, 4H and 1H.
+    The 15M timeframe is the execution/setup timeframe and is the only
+    timeframe used to generate the proposed entry, stop and targets.
+    """
+    d15, d1h, d4h, dd = map(indicators, (d15, d1h, d4h, dd))
+
+    bd = bias(dd)
+    b4 = bias(d4h)
+    b1 = bias(d1h)
     b15 = bias(d15)
     s15 = structure(d15)
 
-    r = (
-        float(d5.rsi.iloc[-1])
-        if pd.notna(d5.rsi.iloc[-1])
-        else 50
-    )
-
-    atr = (
-        float(d5.atr.iloc[-1])
-        if pd.notna(d5.atr.iloc[-1])
-        else float((d5.high - d5.low).tail(14).mean())
-    )
-
-    p = float(d5.close.iloc[-1])
+    r15 = float(d15.rsi.iloc[-1]) if pd.notna(d15.rsi.iloc[-1]) else 50
 
     sell = 0
     buy = 0
     sr = []
     br = []
 
-    if b1 == "BEARISH":
-        sell += 25
-        sr.append("1H bearish EMA alignment")
-    elif b1 == "BULLISH":
-        buy += 25
-        br.append("1H bullish EMA alignment")
+    # Higher-timeframe directional bias.
+    weights = {"Daily": 20, "4H": 25, "1H": 20}
+    for name, b, w in (("Daily", bd, weights["Daily"]),
+                       ("4H", b4, weights["4H"]),
+                       ("1H", b1, weights["1H"])):
+        if b == "BEARISH":
+            sell += w
+            sr.append(f"{name} bearish EMA alignment")
+        elif b == "BULLISH":
+            buy += w
+            br.append(f"{name} bullish EMA alignment")
 
+    # 15M is the only trade/setup timeframe.
     if b15 == "BEARISH":
-        sell += 20
+        sell += 15
         sr.append("15M bearish EMA alignment")
     elif b15 == "BULLISH":
-        buy += 20
+        buy += 15
         br.append("15M bullish EMA alignment")
 
     if s15 == "BEARISH":
-        sell += 20
+        sell += 15
         sr.append("15M bearish structure")
     elif s15 == "BULLISH":
-        buy += 20
+        buy += 15
         br.append("15M bullish structure")
 
-    if r < 45:
-        sell += 10
-        sr.append("5M momentum below neutral")
-
-    if r > 55:
-        buy += 10
-        br.append("5M momentum above neutral")
+    if r15 < 45:
+        sell += 5
+        sr.append("15M momentum below neutral")
+    elif r15 > 55:
+        buy += 5
+        br.append("15M momentum above neutral")
 
     z = fvg(d15)
-
     if z and z[0] == "BEARISH":
-        sell += 15
-        sr.append("Recent bearish FVG")
+        sell += 5
+        sr.append("Recent bearish 15M FVG")
+    elif z and z[0] == "BULLISH":
+        buy += 5
+        br.append("Recent bullish 15M FVG")
 
-    if z and z[0] == "BULLISH":
-        buy += 15
-        br.append("Recent bullish FVG")
+    # Execution gate: 15M direction must agree with the 1H direction,
+    # and the 4H must not be directly opposed to the proposed trade.
+    buy_gate = b1 == "BULLISH" and b15 in ("BULLISH",) and b4 != "BEARISH"
+    sell_gate = b1 == "BEARISH" and b15 in ("BEARISH",) and b4 != "BULLISH"
+
+    if not buy_gate:
+        buy = min(buy, 59)
+    if not sell_gate:
+        sell = min(sell, 59)
+
+    # 15M ATR drives trade planning; no lower timeframe is used.
+    atr15 = float(d15.atr.iloc[-1]) if pd.notna(d15.atr.iloc[-1]) else float((d15.high - d15.low).tail(14).mean())
+    p = float(d15.close.iloc[-1])
 
     return {
         "price": p,
-        "rsi": r,
-        "atr": atr,
+        "rsi15": r15,
+        "atr15": atr15,
+        "bd": bd,
+        "b4": b4,
         "b1": b1,
         "b15": b15,
         "s15": s15,
+        "buy_gate": buy_gate,
+        "sell_gate": sell_gate,
         "sell": min(sell, 100),
         "buy": min(buy, 100),
         "sr": sr,
@@ -274,7 +292,7 @@ def setup(d5, d15, d1):
     }
 
 
-def trade_plan(d5, d15, signal, bid, ask):
+def trade_plan(d15, signal, bid, ask):
     """
     Rule-based planning levels.
 
@@ -287,11 +305,11 @@ def trade_plan(d5, d15, signal, bid, ask):
     """
     current = ask if signal == "BUY" else bid
 
-    atr = float(d5["atr"].iloc[-1])
+    atr = float(d15["atr"].iloc[-1])
     if not np.isfinite(atr) or atr <= 0:
-        atr = float((d5["high"] - d5["low"]).tail(14).mean())
+        atr = float((d15["high"] - d15["low"]).tail(14).mean())
 
-    recent = d5.tail(20)
+    recent = d15.tail(20)
 
     if signal == "BUY":
         swing_low = float(recent["low"].min())
@@ -514,33 +532,33 @@ def render_live_scanner():
     raw = st.session_state.mt5
     price = raw["price"]
 
-    d5 = indicators(df_from(raw["candles"]["5m"]))
-    d15 = indicators(df_from(raw["candles"]["15m"]))
+    dd = indicators(df_from(raw["candles"]["1d"]))
+    d4 = indicators(df_from(raw["candles"]["4h"]))
     d1 = indicators(df_from(raw["candles"]["1h"]))
+    d15 = indicators(df_from(raw["candles"]["15m"]))
 
-    s = setup(d5, d15, d1)
+    s = setup(d15, d1, d4, dd)
 
     bid = float(price["bid"])
     ask = float(price["ask"])
     spread = ask - bid
 
     # Determine the stronger directional setup.
-    if s["buy"] > s["sell"]:
+    if s["buy_gate"] and s["buy"] > s["sell"]:
         primary_signal = "BUY"
         primary_score = s["buy"]
-    elif s["sell"] > s["buy"]:
+    elif s["sell_gate"] and s["sell"] > s["buy"]:
         primary_signal = "SELL"
         primary_score = s["sell"]
     else:
         primary_signal = "NEUTRAL"
-        primary_score = s["buy"]
+        primary_score = max(s["buy"], s["sell"])
 
     score_label, score_icon = classify_score(primary_score)
 
     plan = None
     if primary_signal in ("BUY", "SELL"):
         plan = trade_plan(
-            d5,
             d15,
             primary_signal,
             bid,
@@ -563,7 +581,7 @@ def render_live_scanner():
     b.metric("XAUUSD Ask", f"{ask:,.2f}")
     c.metric("Spread", f"{spread:.2f}")
     d.metric("1H Bias", s["b1"])
-    e.metric("5M RSI", f"{s['rsi']:.1f}")
+    e.metric("15M RSI", f"{s['rsi15']:.1f}")
 
     server_name = getattr(
         raw["account"],
@@ -584,6 +602,22 @@ def render_live_scanner():
         f"Live XAUUSD quote received • "
         f"Last update: {update_text}"
     )
+
+    st.divider()
+
+    st.subheader("🧭 Multi-timeframe directional bias")
+    b1, b2, b3, b4c = st.columns(4)
+    b1.metric("Daily", s["bd"])
+    b2.metric("4H", s["b4"])
+    b3.metric("1H", s["b1"])
+    b4c.metric("15M setup", s["s15"])
+
+    if s["buy_gate"]:
+        st.success("🟢 Long bias is aligned: 1H + 15M agree and 4H is not opposing.")
+    elif s["sell_gate"]:
+        st.error("🔴 Short bias is aligned: 1H + 15M agree and 4H is not opposing.")
+    else:
+        st.warning("🟡 No clean execution alignment: wait for 15M confirmation or a better higher-timeframe alignment.")
 
     st.divider()
 
@@ -666,8 +700,8 @@ def render_live_scanner():
 
             st.caption(
                 "Entry uses the current executable side of the live quote "
-                "(Ask for BUY / Bid for SELL). Stop loss uses recent 5M "
-                "structure plus an ATR buffer. TP levels are fixed 1R/2R/3R "
+                "(Ask for BUY / Bid for SELL). Stop loss uses recent 15M "
+                "structure plus a 15M ATR buffer. TP levels are fixed 1R/2R/3R "
                 "planning targets. These are analytical levels, not guaranteed "
                 "future prices or automatic orders."
             )
@@ -754,38 +788,32 @@ def render_live_scanner():
     st.divider()
 
     st.subheader("📊 BlackBull XAUUSD charts")
-
-    t1, t2, t3 = st.tabs(["5M", "15M", "1H"])
+    t1, t2, t3, t4 = st.tabs(["Daily", "4H", "1H", "15M — Trades"])
 
     with t1:
-        st.plotly_chart(
-            chart(d5, "BlackBull XAUUSD — 5M"),
-            use_container_width=True,
-        )
-
+        st.plotly_chart(chart(dd, "BlackBull XAUUSD — Daily"), use_container_width=True)
     with t2:
-        st.plotly_chart(
-            chart(d15, "BlackBull XAUUSD — 15M"),
-            use_container_width=True,
-        )
-
+        st.plotly_chart(chart(d4, "BlackBull XAUUSD — 4H"), use_container_width=True)
     with t3:
-        st.plotly_chart(
-            chart(d1, "BlackBull XAUUSD — 1H"),
-            use_container_width=True,
-        )
+        st.plotly_chart(chart(d1, "BlackBull XAUUSD — 1H"), use_container_width=True)
+    with t4:
+        st.plotly_chart(chart(d15, "BlackBull XAUUSD — 15M — execution timeframe"), use_container_width=True)
 
     st.caption(
-        "Scores are rule-based technical conditions, not guarantees or "
-        "automatic trade instructions. The app does not place trades. "
-        "Trading-cost figures are estimates based on the live spread and "
-        "selected lot size; verify the broker's final execution cost."
+        "Daily/4H/1H establish directional bias. The 15M is the only "
+        "timeframe used for trade setup, entry, SL and TP planning. Scores "
+        "are rule-based technical conditions, not guarantees or probabilities. "
+        "The app does not place trades. Trading-cost figures are estimates "
+        "based on the live spread and selected lot size; verify the broker's "
+        "final execution cost."
     )
 
 
 # Streamlit fragments support automatic reruns without rerunning the whole app.
 # This is suitable for a live scanner/monitoring display.
 # The scanner defaults to a 5-minute refresh interval to reduce demand.
+# Trades are generated only from the 15M setup timeframe; Daily/4H/1H
+# provide directional context and confirmation.
 run_every = f"{refresh_seconds}s" if auto_refresh else None
 
 @st.fragment(run_every=run_every)
